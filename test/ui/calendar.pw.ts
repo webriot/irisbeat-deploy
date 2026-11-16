@@ -50,7 +50,7 @@ for (const kind of ['http', 'tcp']) {
       await expect(page.getByLabel('Cron', { exact: true })).toHaveValue('0 9 15 * 1');
       await expect(page.locator('#schedule-occurrences time')).toHaveCount(3);
       const preview = await page.locator('#schedule-occurrences').textContent();
-      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await expect(page.locator('#schedule-occurrences')).toHaveText(preview!);
       await expect(page.getByLabel('Cron', { exact: true })).toHaveValue('0 9 15 * 1');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -122,4 +122,42 @@ test('operator configures Calendar Heartbeat grace in duration units and returns
     expect((await (await editing).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', silenceSeconds: 180 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   } finally { await request.delete('/api/operator/monitors/' + monitor.id, { headers: { authorization: 'Bearer ui-test-secret' } }); }
+});
+
+test('switching a draft between kinds and schedules saves only the final supported fields', async ({ page, request }) => {
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'New Monitor', exact: true }).click();
+  await page.getByLabel('Monitor name', { exact: true }).fill('Switched draft');
+  await page.getByLabel('HTTP(S) target', { exact: true }).fill('https://example.invalid');
+  await page.getByLabel('Interval unit', { exact: true }).selectOption('minutes');
+  await page.getByLabel('Interval', { exact: true }).fill('1.01');
+  await page.getByLabel('Check type', { exact: true }).selectOption('heartbeat');
+  await page.getByLabel('Silence', { exact: true }).fill('900');
+  await page.getByLabel('Schedule', { exact: true }).selectOption('calendar');
+  await page.getByLabel('Grace unit', { exact: true }).selectOption('minutes');
+  await page.getByLabel('Grace', { exact: true }).fill('1.5');
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 * * *');
+  await page.getByLabel('Check type', { exact: true }).selectOption('tcp');
+  await page.getByLabel('Hostname', { exact: true }).fill('db.example');
+  await page.getByLabel('Port', { exact: true }).fill('5432');
+  await expect(page.locator('#schedule-occurrences time')).toHaveCount(3);
+  const saving = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/monitors'));
+  await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
+  const response = await saving;
+  expect(response.status()).toBe(201);
+  const monitor = (await response.json()).monitors.at(-1);
+  try {
+    expect(response.request().postDataJSON()).toEqual({
+      name: 'Switched draft', kind: 'tcp', published: true, hostname: 'db.example', port: 5432,
+      scheduleMode: 'calendar', cron: '0 9 * * *', timezone: 'UTC',
+      timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2,
+    });
+    await monitorAction(page, 'Edit Switched draft');
+    await expect(page.getByLabel('Check type', { exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Hostname', { exact: true })).toHaveValue('db.example');
+  } finally {
+    await request.delete('/api/operator/monitors/' + monitor.id, { headers: { authorization: 'Bearer ui-test-secret' } });
+  }
 });
