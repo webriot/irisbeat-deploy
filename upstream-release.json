@@ -1,12 +1,12 @@
 {
-  "version": "0.2.2",
+  "version": "0.3.0",
   "license": "AGPL-3.0-only",
   "contractVersion": "1",
-  "revision": "70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70",
-  "source": "https://github.com/webriot/irisbeat/tree/70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70",
-  "engineIntegrity": "sha512-sUzx3/r+cox4RogphygAv1ZhkTBR0DJGLk/T9tflmqHSp14Y/tPxDlisU6GqNxPknqI2zaf0+Fom61ac/F1Imw==",
+  "revision": "4f9442a0e660907b02c00c942e05ed4e43abab3c",
+  "source": "https://github.com/webriot/irisbeat/tree/4f9442a0e660907b02c00c942e05ed4e43abab3c",
+  "engineIntegrity": "sha512-4nQ7bZK9JBpVOkXa8IaCBVCt1cSBlbSH0TA4xkbXR8CCBgpAaXpYV32jUIz3oeHLNGs+CrY+wlGsyqVHF57NBw==",
   "sha256": {
-    "irisbeat-0.2.2-source.tar.gz": "903b16390681bd616ee09fce4c4988d654f5fa78c05f5c3357a2b7c9d5ec995d",
-    "irisbeat-0.2.2.tgz": "ff36292c9013ae906f64ea312e4d2549118bdb3a552fa0677bcdb4e78ecf2bb4"
+    "irisbeat-0.3.0-source.tar.gz": "f2515d621ac66cadb29191d6676e6feee665363d36750c6901ffd3c121f097b7",
+    "irisbeat-0.3.0.tgz": "f49bfb0195d3c664cab2284ca00e1b7215007348f0a0bf2904eb00dac785c961"
   }
 }
