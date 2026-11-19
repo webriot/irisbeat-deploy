@@ -8,7 +8,7 @@ or production deployment. Final release/distribution remains pending under #12; 
 ## Consumption
 
 Run `npm ci`, `npm run check`, then `npm run test:consumer`. This produces
-`dist/irisbeat-0.3.0.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
+`dist/irisbeat-0.4.0.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
 package and runs both package exports as separate Workers in local workerd,
@@ -62,6 +62,10 @@ HTML or script receives heartbeat credentials or their digests. Operator JSON ad
 `hosted: true` and `permission`; the existing ledger hides editing controls for
 readers and offers hosted credential rotation for editors.
 
+The monitoring Worker's optional `MIN_CHECK_INTERVAL_SECONDS` binding applies
+the same outbound check floor across all resolved contexts. Operator snapshots
+include the effective Interval or Calendar suspension details. [Monitor API](monitor-api.md#outbound-check-floor)
+
 Creation passes the adapter's allowance into the same synchronous DO operation
 that checks the active collection and saves the new Monitor. Private Monitors
 count; deleted ones release capacity. Lowering the allowance does not delete
@@ -70,6 +74,46 @@ existing configuration or prevent edits/checking. Hosted callers must create via
 so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.
+
+## Availability history
+
+Bind `AVAILABILITY_HISTORY` as an Analytics Engine dataset on the Worker that
+hosts `MonitoringContext`. Configure the self-hosted SQL inputs or supply
+`AVAILABILITY_QUERY` as a trusted service binding on that Worker. The query service
+and the write binding use the same Analytics Engine account and dataset. The
+service binding takes precedence over the direct credentials when supplied.
+
+Import `AvailabilityQueryService`, `AvailabilityQuery`, and `AvailabilityRow`
+from `irisbeat`. The engine calls
+`queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]>`.
+The request carries an opaque `tenantKey` (the context's Durable Object ID),
+a batch of 1–50 authorized `monitorIds`, and `start` and `end` in Unix
+milliseconds. The service always filters by the tenant key and the listed IDs.
+Filter on the actual observation timestamp and include `start`, excluding
+`end`. Group by Monitor and UTC day. Return one
+`{ monitorId, date, successes, failures, maintenance }` per observed day, with
+`date` as `YYYY-MM-DD` and each count weighted by `_sample_interval`. Return
+an empty array when no rows match and reject on read failure.
+
+Delayed Status requests include `loggedBefore`, an exclusive cutoff in Unix
+seconds for Analytics Engine's built-in `timestamp` column, which records when
+the Worker logged the point. Apply `timestamp < toDateTime(loggedBefore, 'UTC')`
+alongside the actual observation range before grouping. Use the same cutoff for
+retries of a retained publication, including after a visibility change. Points
+logged exactly at the cutoff are eligible for a subsequent publication. A
+point logged before the cutoff can appear in the same publication when it
+becomes queryable. When the request includes `observation: { at, outcome }`,
+apply both exact filters for the installation readiness probe. Operator,
+immediate Status and readiness queries omit `loggedBefore`.
+
+Keep this service private to trusted Worker
+callers. The caller supplies identity after authorizing the public or Operator
+read, and the service never accepts scopes from browser headers or URLs.
+
+The field layout and cutover are in the
+[availability history handoff](history-api.md). The readiness endpoint is
+editor-only. Existing status payloads keep the 90-day history shape with an
+optional `stale: true` on previously successful aggregates.
 
 ## Heartbeat credentials
 
@@ -331,38 +375,50 @@ Receipts use the same authenticated `POST /heartbeat`, ignore bodies and persist
 
 ## Public subscriptions
 
-Contract 1 adds `GET /api/status/events` with `Upgrade: websocket`. Hono resolves
-it through the same trusted `HostedAdapter.resolve` and context binding as
-`/api/status`. Anonymous access is intentional; operator subscriptions and
-credentials are outside this endpoint. The browser `Origin` must exactly match
-the resolved application URL's origin, including scheme and port. Forwarded host
-headers do not override it. Use HTTPS/WSS in production; HTTP/WS is accepted only
-on localhost and loopback for development. Serve the engine at the trusted
-application URL, and keep the existing context resolution validation.
+Open `GET /api/status/events/v2` with `Upgrade: websocket`. Hono resolves the
+same trusted context as `GET /api/status`. The browser `Origin` must exactly
+match the application's origin, including scheme and port. Use HTTPS/WSS in
+production. HTTP/WS is accepted on localhost and loopback for development.
 
-The existing `MonitoringContext` accepts the connection through Cloudflare's
-Hibernation WebSocket API. Its fixed text message `changed` means fetch the current
-`/api/status` snapshot. There are no snapshots, fields, identifiers, revisions or
-credentials on the socket. Only public projection changes notify: published
-Monitor results/history (including Calendar Checks and finalized Heartbeat occurrences),
-last-seen receipts, publication, names, visible
-Incidents, Maintenance and pause. Target/timing-only settings, webhook destinations,
-private Monitor activity and other contexts remain silent. Notification comparison
-and send happen synchronously after persistence and before external alert delivery.
+The Durable Object sends JSON text hints through hibernating WebSockets:
 
-After processing a notice and completing its snapshot read, send exactly `ack`.
-This acknowledges delivery only and cannot mutate monitoring data. Each socket
-retains one pending notice plus one dirty bit; changes while pending collapse into
-one further `changed` after acknowledgment. Attachments and the public subscription
-tag survive hibernation. Unexpected messages, including unsolicited acknowledgments
-and binary messages, close with 1008. The context accepts at most 128 connections;
-excess upgrades return 503. No-origin/cross-origin or insecure nonlocal requests
-return 403; requests without an upgrade return 426. Closed sockets are removed by
-the runtime. Public Maintenance expiry and UTC history rollover use a storage alarm
-while published Monitors have subscribers; no permanent server timer is needed.
+```json
+{"type":"changed","revision":42,"scopes":["monitor/9b0dceda-7dac-4c39-899c-c997af760151","banner","incidents"]}
+```
 
-Clients must subscribe **before** fetching a fresh snapshot, and repeat that read
-on every reconnect. Notifications are hints, not a replay log. The public UI bounds
+The scope names are `page`, `banner`, `monitors`, `monitor/<id>`,
+`incidents`, and, for editors, `destinations`. A single row scope identifies
+one visible Monitor. `monitors` replaces the ordered ledger for membership
+changes, pause, or UTC rollover and supersedes individual row scopes in a
+coalesced hint. Public hints cover published Monitor data and visible Incidents,
+Maintenance, page settings and pause. Public Monitor IDs already appear in the
+anonymous snapshot. Reader hints also cover private Monitor activity in their
+context. Only editor hints include destination and selection changes.
+
+For each hinted scope, fetch
+`GET /api/status/partials/<scope>?revision=<revision>` or its authorized
+`/api/operator/partials/<scope>` counterpart. Hono returns `{ revision, html }`
+plus Operator permission and the metadata needed to update actions and preserve
+drafts. A gone or invisible row returns empty HTML, as does an unknown row.
+An inaccessible section returns 404. A successful response has a revision at
+least as high as the requested minimum (409 if unavailable). The default
+minimum is zero. Each partial uses the current request's trusted tenant and
+permissions. Operator partials bypass shared caches. Public partials use the
+published Status revision and a regional edge cache.
+
+After processing a notice and its reads, send exactly `ack`. Each socket holds
+one pending hint and a coalesced successor covering the union of queued scopes
+at the newest revision. More than 32 queued rows collapse into `monitors`.
+Attachments survive hibernation. Unexpected messages, including unsolicited
+acknowledgments and binary messages, close with 1008. Each context accepts at
+most 128 public connections. Excess upgrades return 503, invalid Origin or
+insecure nonlocal requests return 403, and a request without an upgrade returns
+426. Maintenance expiry and UTC rollover use a storage alarm while there are
+relevant subscribers and are also detected on reads.
+
+Subscribe before fetching a fresh snapshot, and repeat that read on every
+reconnect. The full snapshot recovers changes missed while disconnected.
+The public UI bounds
 reads to one active request and one queued refresh, ignores an intermediate response
 when another refresh is queued, and aborts reads after ten seconds. It preserves
 existing row nodes, history selection and focus. Reconnect delays increase from
@@ -374,15 +430,15 @@ return and Retry fetch immediately without reloading. Retry stays disabled while
 pending; only a successful snapshot read clears the failure. Recovery is announced
 and moves focus from the removed Retry control to the page heading.
 Page exit closes the connection, and returning from the browser page cache resubscribes.
-All mutations continue through existing HTTP routes. JSON shapes and contract version
-remain unchanged.
+All mutations continue through existing HTTP routes with their established JSON
+shapes. Hosted adapter contract version remains `1`.
 
 Implementation references: [Cloudflare Hibernation WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 and [Hono upgrade middleware caveat](https://hono.dev/docs/helpers/websocket).
 
 ## Operator subscriptions
 
-Contract 1 adds an authenticated handoff for `GET /api/operator/events`. Open a
+The authenticated subscription uses `GET /api/operator/events/v2`. Open a
 same-origin WebSocket, then obtain `POST /api/operator/events/ticket` using the
 same authorization as `GET /api/operator`. The personal Worker checks the
 installation Bearer secret; hosted Workers call `HostedAdapter.resolve` on every
@@ -395,13 +451,10 @@ operator audience, exact application origin and resolved reader/editor permissio
 The **first** socket message must be JSON `{ "type": "auth", "ticket": "…" }`.
 Before it succeeds, the socket receives no notifications, including private
 activity. Success returns the fixed text `authorized`; immediately fetch the
-current authorized `/api/operator` snapshot. Notifications use the same fixed
-`changed` and `ack` protocol as public subscriptions, with one pending notice and
-one dirty bit. They carry no configuration, identifiers or credentials. Operators
-receive private Monitor/configuration/results/history/Incident/Maintenance/pause
-changes in their context. Readers do not receive webhook-only change activity.
-A permission change discards previously queued dirty activity before the client
-resynchronizes. Public and other-context subscribers remain isolated.
+current authorized `/api/operator` snapshot. Operator sockets use the same
+scoped JSON hint and `ack` protocol. A permission change discards previously
+queued scopes before the client resynchronizes. Public and other-context
+subscribers have independent streams.
 
 Authorization lasts at most **five minutes from ticket issuance**, enforced by
 server alarms and checked before every operator message or notification. Obtain
@@ -453,3 +506,105 @@ and clears private UI state. Session guards reject late ticket and snapshot
 responses. Consumer UIs must implement the same teardown on sign-out and denied
 renewal; they must not leave a valid lease running after local authorization loss.
 All writes continue through existing authorized HTTP routes.
+
+### Committed revision and publication handoff
+
+Each Durable Object keeps independent increasing public, reader and editor
+revisions. Each affected audience advances once in the same SQLite transaction
+as the changed state. Separate counters prevent a public or reader client from
+inferring hidden activity from revision gaps. A revision is meaningful within
+its trusted context and audience. It is independent of hosted policy revision.
+
+`MonitoringContext.publishViewChanges(hints)` is the synchronous post-commit
+hook for committed changes. Each entry is a `ViewHint` containing the committed
+revision and affected resources for its audience. In delayed mode, hosted
+overrides forward public hints from `onStatusPublished(hint)`. In immediate
+mode they can forward them from `publishViewChanges`. `readView(scope, audience)` returns
+projection input and its committed revision together. Hono owns the HTML
+rendering. The availability provider is consulted only for ledger or row reads.
+The internal Operator configuration, Maintenance, and destination RPCs return the editor revision and affected
+scopes. The bundled clients request `Accept: application/vnd.irisbeat.view+json`
+for full refreshes of `/api/status` and `/api/operator`. Hono renders those
+refreshes with the same components as the scoped resources. Bundled Operator
+writes use the same header and receive `{ revision, scopes }` after commit.
+The browser fetches those scopes over authenticated HTTP immediately, including
+when its WebSocket is disconnected. A failed partial refresh triggers a full
+read. Legacy clients retain the existing JSON reads and mutation responses
+without the media type.
+
+Public publication coalesces revisions and scopes in a durable pending record.
+`STATUS_RENDER_INTERVAL_SECONDS` defaults to 60. Positive values through 86,400
+set a UTC-aligned window. An explicit `"0"` opts into immediate public
+rendering. Use the same binding in the HTTP Worker and the MonitoringContext
+Worker when they are configured separately. Invalid values fall back to 60
+seconds and log `invalid_status_render_interval`.
+
+With public subscribers, the subscription alarm wakes at the next publication
+boundary. The Hono render functions prepare the affected partials and the
+MonitoringContext saves the public projection. The synchronous protected
+`onStatusPublished(hint)` hook then receives the coalesced public hint. Call
+`super.onStatusPublished(hint)` to retain built-in WebSocket delivery. An
+override can read the prepared partials through `readPublishedStatus(scope,
+hint.revision)`. The saved projection supports those reads after eviction.
+Reader and editor hints still follow their committed revisions immediately.
+
+With no public subscribers, the first GET after the boundary renders the latest
+elapsed publication and invokes the same hook. At rollover, the
+MonitoringContext retains the elapsed window's public inputs, revision, and
+scopes before a newer write can affect them. When several windows elapse
+without a render, publication uses the latest eligible inputs and carries
+forward the affected scopes. Maintenance expiry and UTC history rollover take
+effect in the windows containing their expiry time and midnight, respectively,
+even if discovered later. Before the first delayed change, the
+MonitoringContext saves the prior public inputs so even a first-ever GET within
+the window sees the pre-change Status. Entering immediate mode discards the
+old delayed publication and pending hints. Returning to delayed mode starts
+from the current state. An unpublish can take the same window to appear on
+anonymous Status. Operator authorization, Check commits, and alert handoff
+stay independent of the public window.
+
+Cloudflare's Cache API stores anonymous documents, snapshots, and partials
+regionally. The MonitoringContext resolves the eligible publication revision
+before the HTTP Worker looks up a cache entry. The key includes the trusted
+Durable Object ID, resource, publication revision, and render generation, so ordinary GETs catch up
+even when an edge clock differs from the publication clock or a client missed a
+hint. A hinted revision is a lower bound on the same URL. An edge miss renders
+the published projection and an unavailable minimum returns 409. Static assets
+and the generic Operator shell use content-based keys. Client-facing responses
+retain `Cache-Control: no-store`. Hosted deployments can bind
+`IRISBEAT_VERSION` using Wrangler version metadata to isolate Status entries by
+deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
+
+#### Availability in a public publication
+
+The MonitoringContext seals an elapsed window before a later change can alter
+its Monitor set, Incidents, observation revisions or UTC history range. A later
+open window retains its own pending changes. Maintenance expiry and UTC rollover
+use their effective time when discovered after idle periods. The MonitoringContext queries before
+rendering, persisting the projection, and sending the public hint. An observation
+committed later stays outside that series even if its observation timestamp is
+in the published range. Check commits, notification handoff and Operator
+authorization proceed independently of the query.
+
+`statusPublicationRevision(resource?, minimum?)` resolves the eligible revision
+and render generation before an edge lookup. `readPublishedStatus(resource,
+minimum)` reads the prepared render with the same version fields. A scoped
+retry GET can revalidate a stale, pending or unavailable row even on a warm
+edge. The MonitoringContext records a per-row retry deadline. An ordinary GET
+after that deadline can revalidate the unresolved rows it reads even after the
+browser finishes its four retries. Successful changes persist the corrected
+series and advance the render generation together. All anonymous representations
+use the resulting generation. The public hint revision and the publication
+window still control when new Monitor state and visibility become public.
+
+### Upgrade from unscoped subscriptions
+
+Deploy the Worker and its bundled browser assets together. The documents
+reference `?live=2` browser scripts and the scoped sockets use the `/events/v2`
+paths. Legacy upgrade paths return 404. Pre-upgrade tabs recover over the
+existing snapshot polling; reloading loads the scoped client. The Durable Object
+closes incompatible hibernated attachments with 1012 when it next inspects them.
+Existing state starts at revision zero and remains readable. Run
+`node test/upgrade.cjs --live-views` with Chromium installed to verify both
+browser generations across an actual Worker bundle swap.

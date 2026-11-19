@@ -8,7 +8,13 @@ export default defineConfig({
       main: "./test/history-worker.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        bindings: { INSTALLATION_SECRET: "test-installation-secret" },
+        workers: [{
+          name: "irisbeat-deploy-delivery",
+          modules: true,
+          compatibilityDate: "2026-11-18",
+          script: "import { WorkerEntrypoint } from 'cloudflare:workers'; export class NotificationEmailCapability extends WorkerEntrypoint { isConfigured() { return false; } }",
+        }],
+        bindings: { INSTALLATION_SECRET: "test-installation-secret", STATUS_RENDER_INTERVAL_SECONDS: "0" },
       },
     }),
   ],

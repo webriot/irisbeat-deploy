@@ -5,30 +5,35 @@ const { readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { createHash } = require('node:crypto');
 const assert = require('node:assert/strict');
+const { version } = require('../package.json');
 const project = process.cwd();
 const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
+function availabilityTotals({ history }) {
+  return { days: history.days, percentage: history.percentage };
+}
 (async () => {
   const prepared = process.argv.includes('--prepared');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'inherit' });
-  const artifact = 'dist/irisbeat-0.3.0.tgz';
+  const filename = `irisbeat-${version}.tgz`;
+  const artifact = 'dist/' + filename;
   const checksum = createHash('sha256').update(readFileSync(artifact)).digest('hex');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'pipe' });
   assert.equal(createHash('sha256').update(readFileSync(artifact)).digest('hex'), checksum, 'packing the same revision is reproducible');
   if (prepared) {
     const release = JSON.parse(readFileSync('dist/release.json'));
-    assert.equal(checksum, release.sha256['irisbeat-0.3.0.tgz'], 'consume the exact prepared release artifact');
-  } else writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.3.0.tgz\n');
+    assert.equal(checksum, release.sha256[filename], 'consume the exact prepared release artifact');
+  } else writeFileSync('dist/SHA256SUMS', checksum + '  ' + filename + '\n');
   rmSync('test/consumer/node_modules', { recursive: true, force: true });
   rmSync('test/consumer/package-lock.json', { force: true });
   execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync('npm', ['ci', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync(join(project, 'node_modules/.bin/tsc'), ['--noEmit', '--project', 'test/consumer/tsconfig.json'], { stdio: 'inherit' });
   const installed = JSON.parse(readFileSync('test/consumer/node_modules/irisbeat/package.json', 'utf8'));
-  assert.equal(installed.version, '0.3.0');
+  assert.equal(installed.version, version);
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
-  assert.equal(lock.packages['node_modules/irisbeat'].version, '0.3.0');
+  assert.equal(lock.packages['node_modules/irisbeat'].version, version);
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
   await require('./notification-delivery.cjs').testInstalledDelivery();
   const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
@@ -50,7 +55,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   let holdQueue = false;
   let overlapAction;
   let now = 0;
-  const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
+  const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', bindings: { STATUS_RENDER_INTERVAL_SECONDS: '0' }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
     if (request.url.startsWith('https://policy-gate.example/')) {
       const gate = policyGates.get(new URL(request.url).pathname.slice(1));
       gate.captured(); await gate.released;
@@ -112,7 +117,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const incidentTransitionsFor = monitorId => incidentJobs().filter(job => job.monitorId === monitorId).map(job => job.event.kind);
   try {
     {
-      const response = await mf.dispatchFetch('https://a.example/api/status/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      const response = await mf.dispatchFetch('https://a.example/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
       assert.equal(response.status, 101, 'packed consumer routes public upgrades');
       const socket = response.webSocket;
       socket.accept();
@@ -124,7 +129,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await settle(); assert.deepEqual(messages, [], 'private changes and other contexts remain silent');
       await request('a.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
       await request('a.example', '/api/operator', 'PUT', { pageName: 'Public consumer' });
-      await settle(); assert.deepEqual(messages, ['changed'], 'only a fixed public invalidation crosses the consumer boundary');
+      await settle(); assert.deepEqual(messages.map(JSON.parse), [{ type: 'changed', revision: 1, scopes: ['page'] }], 'only a scoped public hint crosses the consumer boundary');
       assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Public consumer');
       const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
       socket.close(); await closed;
@@ -132,7 +137,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     {
       // Use wall time for this real socket exchange; deterministic dispatch tests below retain their clock.
       const previousNow = now; now = Date.now();
-      const socketResponse = await mf.dispatchFetch('https://a.example/api/operator/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      const socketResponse = await mf.dispatchFetch('https://a.example/api/operator/events/v2', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
       assert.equal(socketResponse.status, 101);
       const socket = socketResponse.webSocket; socket.accept();
       const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
@@ -148,11 +153,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await request('b.example', '/api/operator', 'PUT', { pageName: 'Other operator context' });
       await settle(); assert.deepEqual(messages, ['authorized'], 'other contexts cannot reach an operator subscription');
       const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private operator producer', kind: 'heartbeat', published: false })).json();
-      await settle(); assert.deepEqual(messages, ['authorized', 'changed'], 'reader receives notification only; authorized HTTP owns the projection');
+      await settle(); assert.deepEqual(messages.map(message => message === 'authorized' ? message : JSON.parse(message).type), ['authorized', 'changed'], 'reader receives notification only; authorized HTTP owns the projection');
       socket.send('ack'); await settle();
       const renewal = await request('a.example', '/api/operator/events/ticket', 'POST');
       socket.send(JSON.stringify({ type: 'renew', ticket: (await renewal.json()).ticket }));
-      await settle(); assert.deepEqual(messages, ['authorized', 'changed', 'authorized'], 'permission promotion renews in place');
+      await settle(); assert.deepEqual(messages.map(message => message === 'authorized' ? message : JSON.parse(message).type), ['authorized', 'changed', 'authorized'], 'permission promotion renews in place');
       await request('a.example', '/test-operator-permission?value=revoked');
       assert.equal((await request('a.example', '/api/operator/events/ticket', 'POST')).status, 401, 'unchanged bearer cannot renew after hosted revocation');
       assert.equal((await request('a.example', '/api/operator')).status, 401, 'snapshot checks remain independent');
@@ -484,7 +489,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const paused = await read();
       assert.equal(paused.paused, true, 'omitted request and schedule metadata preserve pause');
       assert.equal(paused.monitor.state, 'paused');
-      assert.deepEqual(paused.monitor.history, before.monitor.history, kind + ' pause retains bars/denominator');
+      assert.deepEqual(availabilityTotals(paused.monitor), availabilityTotals(before.monitor), kind + ' pause retains bars/denominator');
       assert.deepEqual(paused.monitor.lastResult, before.monitor.lastResult);
       assert.deepEqual([targetCount, queued.length], counts, kind + ' pause suppresses checking and Queue handoff');
       assert.ok((await (await request('a.example', '/')).text()).includes('Monitoring paused'));
@@ -536,7 +541,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       };
       await tick(now + 60_000);
       assert.deepEqual((await read()).monitor.lastResult, open.monitor.lastResult, 'paused pending recovery leaves prior result intact');
-      assert.deepEqual((await read()).monitor.history, open.monitor.history);
+      assert.deepEqual(availabilityTotals((await read()).monitor), availabilityTotals(open.monitor));
       assert.equal((await read()).incidents.find(row => row.id === openIncident.id).closedAt, null);
       await tick(now + 60_000);
       assert.equal(queued.length, counts + 1, 'discarded recovery does not seed counts');
@@ -599,7 +604,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await policy('omit');
       await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Calendar restart' }));
       assert.equal((await read()).paused, true);
-      assert.deepEqual((await read()).monitor.history, frozen.history);
+      assert.deepEqual(availabilityTotals((await read()).monitor), availabilityTotals(frozen));
       assert.deepEqual([targetCount, queued.length], calendarCounts.map(n => n + 1));
       await policy('false', 'request'); await read();
       await tick(calendarBase + 180_000);
@@ -624,7 +629,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       };
       await tick(calendarBase + 480_000);
       assert.deepEqual((await read()).monitor.lastResult, beforePending.lastResult, kind + ' Calendar pause/resume discards pending result');
-      assert.deepEqual((await read()).monitor.history, beforePending.history);
+      assert.deepEqual(availabilityTotals((await read()).monitor), availabilityTotals(beforePending));
       assert.equal(queued.length, pendingCounts);
       await tick(calendarBase + 480_000);
       assert.equal(queued.length, pendingCounts, 'resume starts at a future occurrence');
@@ -693,6 +698,6 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     await request('a.example', overlapPath, 'DELETE');
     assert.deepEqual(deliveries, [], 'the installed legacy override received no Queue-enabled transitions');
     console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and queued transitions');
-    console.log('PASS packed irisbeat@0.3.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/Heartbeat Queue jobs, exclusive delivery, enqueue failure isolation, rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
+    console.log(`PASS packed irisbeat@${version}: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/Heartbeat Queue jobs, exclusive delivery, enqueue failure isolation, rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression`);
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

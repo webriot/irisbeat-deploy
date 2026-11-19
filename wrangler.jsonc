@@ -4,6 +4,18 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-13",
   "workers_dev": true,
+  "version_metadata": { "binding": "IRISBEAT_VERSION" },
+  "keep_vars": true,
+  "analytics_engine_datasets": [
+    { "binding": "AVAILABILITY_HISTORY", "dataset": "irisbeat_deploy_availability" },
+  ],
+  "vars": {
+    "AVAILABILITY_DATASET": "irisbeat_deploy_availability",
+    "NOTIFICATION_PUBLIC_ORIGIN": "https://irisbeat-deploy.webriot.workers.dev",
+  },
+  "services": [
+    { "binding": "NOTIFICATION_EMAIL", "service": "irisbeat-deploy-delivery", "entrypoint": "NotificationEmailCapability" },
+  ],
   "triggers": {
     "crons": ["* * * * *"],
   },
@@ -31,6 +43,6 @@
     },
   },
   "secrets": {
-    "required": ["INSTALLATION_SECRET"],
+    "required": ["INSTALLATION_SECRET", "AVAILABILITY_API_TOKEN"],
   },
 }
