@@ -147,7 +147,7 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
     <main><div class="page-clock"><time id="page-clock"></time></div><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
-    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.4.1/irisbeat-0.4.1-source.tar.gz">Source (AGPL-3.0-only)</a>
+    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.4.2/irisbeat-0.4.2-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
   </body></html>;
@@ -345,7 +345,7 @@ function fragment(html) {
   template.innerHTML = html;
   return template.content;
 }
-function liveSnapshots(path, read, authorize) {
+function liveSnapshots(path, read, authorize, viewPermission) {
   let running, queued, ackSocket;
   let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
   let minimumRevision = 0;
@@ -414,11 +414,11 @@ function liveSnapshots(path, read, authorize) {
       }
     }
   }
-  async function authenticate(current, type) {
+  async function authenticate(current, type, permission) {
     try {
       const ticket = await authorize();
       if (stopped || current !== socket || current.readyState !== WebSocket.OPEN) return;
-      current.send(JSON.stringify({ type, ticket }));
+      current.send(JSON.stringify({ type, ticket, permission }));
     } catch { if (current === socket) current.close(); }
   }
   function connect() {
@@ -428,15 +428,20 @@ function liveSnapshots(path, read, authorize) {
       const url = new URL(path, location.href);
       url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const current = socket = new WebSocket(url);
+      let renewingPermission;
       handshake = setTimeout(() => current.close(), 10000);
-      function connected() {
-        clearTimeout(handshake); minimumRevision = 0; ready = true; pollingMode(); sync();
+      function connected(continuous) {
+        clearTimeout(handshake); renewingPermission = undefined;
+        if (!continuous) {
+          minimumRevision = 0; ready = true; pollingMode(); sync();
+        }
         if (authorize) {
           clearTimeout(renewal);
           renewal = setTimeout(() => {
             if (stopped || current !== socket) return;
             handshake = setTimeout(() => current.close(), 10000);
-            authenticate(current, 'renew');
+            renewingPermission = viewPermission();
+            authenticate(current, 'renew', renewingPermission);
           }, 240000);
         }
       }
@@ -447,6 +452,9 @@ function liveSnapshots(path, read, authorize) {
       current.onmessage = event => {
         if (current !== socket) return;
         if (authorize && event.data === 'authorized') { connected(); return; }
+        if (renewingPermission && event.data === 'renewed') {
+          connected(renewingPermission === viewPermission()); return;
+        }
         if (!ready) return;
         let hint;
         try { hint = JSON.parse(event.data); } catch { current.close(); return; }
@@ -992,7 +1000,7 @@ function renderOperatorSnapshot(data, savedField) {
   restoreOperatorFocus(focused);
 }
 
-const session = createOperatorSession(liveSnapshots, {
+const session = createOperatorSession(liveSnapshots, mergeScopes, {
   partials: renderOperatorPartials,
   snapshot: renderOperatorSnapshot,
   pageNameSaved() { savedPageName = byId('pageName').value; },

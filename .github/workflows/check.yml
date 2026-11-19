@@ -18,6 +18,8 @@ jobs:
       - run: npx tsc --noEmit
       - run: npm test
       - run: npm run test:delivery
+      - name: Generate runtime types for the standalone consumer
+        run: npm run types -- --include-env=false
       - run: npm run test:consumer
       - run: npm run build
       - run: npm run build:delivery
