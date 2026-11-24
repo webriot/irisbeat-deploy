@@ -53,13 +53,13 @@ manifest's full revision is the one you intend to deploy.
 For an unpublished candidate, use the artifacts produced by `release:prepare`
 from its reviewed Git revision instead of a release download.
 Download the engine tarball as well so the checksum command can verify every
-listed file. The commands below use 0.4.3 as an example. Use the version you
+listed file. The commands below use 0.4.4 as an example. Use the version you
 downloaded.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf irisbeat-0.4.3-source.tar.gz
-cd irisbeat-0.4.3
+tar -xzf irisbeat-0.4.4-source.tar.gz
+cd irisbeat-0.4.4
 npm ci
 npm run check
 npm run build
@@ -173,11 +173,13 @@ above. Keep automatic traces disabled on that Worker because
 Workers Logs still capture sanitized submission failures. `npm run build:delivery`
 dry-runs the bundle and `npm run test:delivery` exercises both Workers locally.
 
-In Operator Settings, choose Add webhook under Notification destinations. Then
-edit each Monitor that should send Incident notifications, check the desired
-destinations, and save the Monitor. Upgraded webhooks retain their address and
-start unselected on every Monitor. Removing a webhook or replacing its address
-clears its selections. Slack-compatible messages include the Monitor
+In Operator Settings, choose **Add webhook** under **Notification destinations**
+and enter a name and URL. Edit each Monitor that should send Incident notifications,
+choose destinations by name, and save the Monitor. Existing destinations receive
+generated names and keep their selections. Use **Edit** to rename a destination
+or change its address. Changing the address or removing the destination clears
+its selections. A replacement email address requires confirmation.
+Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. The monitoring and delivery Workers can run with webhook bindings alone.
 Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
 Incident detection and Incident alerts are suppressed, and Incidents are retained.
@@ -339,8 +341,8 @@ installed Worker.
   named `NOTIFICATION_EMAIL` pointing to the delivery Worker's
   `NotificationEmailCapability` entrypoint. The Workers can first be deployed with
   webhooks, then the monitoring Worker can be redeployed with the optional reverse binding.
-- Open Operator Settings and choose **Add email**. The recipient opens the message
-  and clicks **Confirm email** on the confirmation page. The inbox can then be
+- Open Operator Settings, choose **Add email**, and enter a name and email address.
+  The recipient opens the message and clicks **Confirm email**. The inbox can then be
   selected on individual Monitors. Pending inboxes offer **Resend confirmation**.
   Resending replaces the previous link. The five-minute cooldown applies within
   the installation even if the inbox is removed and re-added.
@@ -394,8 +396,8 @@ These checks use local workerd, controlled time and synthetic recipients.
 
 | Artifact | Use |
 | --- | --- |
-| `irisbeat-0.4.3-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.4.3.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
+| `irisbeat-0.4.4-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
+| `irisbeat-0.4.4.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 
