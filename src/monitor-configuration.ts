@@ -2,6 +2,8 @@
 import { calendar, type Schedule } from "./calendar";
 import { selectableDestination, type NotificationDestination, type NotificationSelection } from "./notification-jobs";
 
+export const destinationPendingConfirmation = "destination_pending_confirmation";
+
 export const timingDefaults = {
   intervalSeconds: 60,
   timeoutSeconds: 10,
@@ -34,6 +36,7 @@ type Target =
   | { kind: "tcp"; hostname: string; port: number; url?: never }
   | { kind: "heartbeat"; url?: never; hostname?: never; port?: never };
 type MonitorConfiguration = { name: string; published?: boolean } & Target & Partial<Timing> & Schedule;
+type PreparedMonitorCreate = { configuration: MonitorConfiguration; destinationIds?: string[] };
 type ScheduleConfiguration = Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">;
 type Configuration = MonitorConfiguration & { pageName: string };
 
@@ -61,6 +64,36 @@ export type Monitor = MonitorConfiguration & Timing & {
   historyChangedAt?: number;
   notificationSelections?: NotificationSelection[];
 };
+
+export function monitorResource(monitor: Monitor) {
+  const common = {
+    id: monitor.id,
+    name: monitor.name,
+    published: monitor.published,
+    scheduleMode: monitor.scheduleMode ?? "interval",
+    recoveryThreshold: monitor.recoveryThreshold,
+    destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId),
+    ...(monitor.scheduleMode === "calendar"
+      ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
+  };
+  if (monitor.kind === "heartbeat") {
+    return {
+      ...common, kind: monitor.kind,
+      ...(monitor.scheduleMode === "calendar" ? { graceSeconds: monitor.graceSeconds } : {
+        intervalSeconds: monitor.intervalSeconds,
+        silenceSeconds: monitor.silenceSeconds,
+        recoverySpacingSeconds: monitor.recoverySpacingSeconds,
+      }),
+    };
+  }
+  const outbound = {
+    ...common, intervalSeconds: monitor.intervalSeconds,
+    timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold,
+  };
+  return monitor.kind === "tcp"
+    ? { ...outbound, kind: monitor.kind, hostname: monitor.hostname, port: monitor.port }
+    : { ...outbound, kind: monitor.kind, url: monitor.url };
+}
 
 // Internal synchronous operations owned by MonitoringContext. Only Calendar validation may yield.
 type ConfigurationRuntime<State, Result> = {
@@ -150,18 +183,37 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
-  async create(value: unknown, limit?: number) {
-    if (value && typeof value === "object" && "destinationIds" in value &&
-        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
+  async prepareCreate(value: unknown): Promise<PreparedMonitorCreate | undefined> {
     const configuration = parseMonitorPatch(value);
     if (!configuration || !this.validInterval(configuration)) return undefined;
+    const fields = value as Record<string, unknown>;
+    const destinationIds = "destinationIds" in fields ? parseDestinationIds(fields.destinationIds) : undefined;
+    if (destinationIds === null) return undefined;
     if (this.scheduleProof(configuration, configuration) && !await this.acceptsProof(configuration)) return undefined;
+    return { configuration, destinationIds };
+  }
+
+  async create(value: unknown, limit?: number) {
+    const prepared = await this.prepareCreate(value);
+    if (!prepared) return undefined;
+    return this.createPrepared(prepared, limit);
+  }
+
+  createPrepared({ configuration, destinationIds }: PreparedMonitorCreate, limit?: number,
+    commit = (state: State, monitor: Monitor) => this.runtime.commit(state, state.pageName, undefined, monitor),
+  ) {
     const state = this.runtime.read();
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     const monitor = this.newMonitor(configuration);
+    if (destinationIds !== undefined) {
+      const selections = replacementSelections(destinationIds, state.destinations);
+      if (!Array.isArray(selections)) return selections;
+      monitor.notificationSelections = selections;
+    }
     state.monitors.push(monitor);
-    return this.runtime.commit(state, state.pageName, undefined, monitor);
+    const ack = commit(state, monitor);
+    return { ack, monitor };
   }
 
   async edit(id: string, value: unknown) {
@@ -190,21 +242,20 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         const selections = new Map(monitor.notificationSelections?.map(selection => [selection.destinationId, selection]));
         for (const [destinationId, selected] of entries) {
           if (!selected) selections.delete(destinationId);
-          else if (!selections.has(destinationId)) selections.set(destinationId, { destinationId, generation: crypto.randomUUID() });
+          else if (!selections.has(destinationId)) selections.set(destinationId, newSelection(destinationId));
         }
         monitor.notificationSelections = [...selections.values()];
       }
       if (value && typeof value === "object" && "destinationIds" in value) {
-        const ids = value.destinationIds;
-        if (!Array.isArray(ids) || ids.some(id => !state.destinations?.some(destination => destination.id === id && selectableDestination(destination))) ||
-            new Set(ids).size !== ids.length) return undefined;
-        const existing = monitor.notificationSelections ?? [];
-        monitor.notificationSelections = ids.map(destinationId =>
-          existing.find(selection => selection.destinationId === destinationId) ??
-          { destinationId, generation: crypto.randomUUID() });
+        const destinationIds = parseDestinationIds(value.destinationIds);
+        if (!destinationIds) return undefined;
+        const selections = replacementSelections(destinationIds, state.destinations, monitor.notificationSelections);
+        if (!Array.isArray(selections)) return selections;
+        monitor.notificationSelections = selections;
       }
       this.applyEdit(monitor, patch, proof !== null);
-      return this.runtime.commit(state, state.pageName, previous, monitor);
+      const ack = this.runtime.commit(state, state.pageName, previous, monitor);
+      return { ack, monitor };
     }
   }
 
@@ -231,6 +282,25 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       monitor.nextDue += (patch.intervalSeconds - monitor.intervalSeconds) * 1000;
     Object.assign(monitor, patch);
   }
+}
+
+function parseDestinationIds(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  const ids = [...value];
+  return ids.every(id => typeof id === "string") && new Set(ids).size === ids.length ? ids : null;
+}
+
+function replacementSelections(ids: string[], destinations: NotificationDestination[] = [], existing: NotificationSelection[] = []) {
+  const assigned = ids.map(id => destinations.find(destination => destination.id === id));
+  if (!assigned.every(destination => destination !== undefined)) return undefined;
+  if (!assigned.every(selectableDestination)) return destinationPendingConfirmation;
+  return assigned.map(({ id: destinationId }) =>
+    existing.find(selection => selection.destinationId === destinationId) ??
+    newSelection(destinationId));
+}
+
+function newSelection(destinationId: string): NotificationSelection {
+  return { destinationId, generation: crypto.randomUUID() };
 }
 
 function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http", current?: MonitorConfiguration): Configuration | null {

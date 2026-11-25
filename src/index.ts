@@ -2,7 +2,7 @@
 import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { destinationPendingConfirmation, minimumCheckIntervalSeconds, MonitorConfigurations, monitorResource, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, parseWebhook, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
@@ -83,6 +83,25 @@ type StoredContext = {
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 type DestinationUpdate = (NewNotificationDestination & { name?: string }) | { name: string };
+type DestinationError = "duplicate" | "duplicate-name" | "unconfigured" | "cooldown" | "paused";
+
+function destinationResource(destination: NotificationDestination): NotificationDestination {
+  const { id, name, channel } = destination;
+  return channel === "webhook" ? { id, name, channel, url: destination.url }
+    : { id, name, channel, address: destination.address, confirmed: destination.confirmed };
+}
+
+type ApiKeyRole = "read" | "write";
+type ApiKey = { id: string; name: string; role: ApiKeyRole; createdAt: number; expiresAt: number | null };
+const apiKeyPrefix = "irb_";
+
+function canonicalBearer(authorization: string | undefined) {
+  return authorization?.replace(/^Bearer +/i, "Bearer ");
+}
+
+function credentialDigest(authorization: string) {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization));
+}
 
 function nextDestinationName(channel: NewNotificationDestination["channel"], used: Set<string>) {
   const prefix = channel === "email" ? "Email" : "Webhook";
@@ -131,14 +150,44 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
     (url.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
 }
 
+const monitorCollection = "/api/v1/monitors";
+const versionedDestinationsPath = "/api/v1/destinations";
+const createResultCleanupLimit = 100;
+type CreateEndpoint = typeof monitorCollection | typeof versionedDestinationsPath;
+type IdempotencyRequest = { key: string; digest: ArrayBuffer };
+type CreateResult = { status: number; body: string; headers: Record<string, string> };
+type SavedCreateResult = CreateResult & { confirmation?: ConfirmationJob };
+
+function createdResource(resource: { id: string }, collection?: CreateEndpoint): CreateResult {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (collection) headers.Location = collection + "/" + resource.id;
+  return { status: 201, body: JSON.stringify(resource), headers };
+}
+
+function createResponse(result: CreateResult | "idempotency-conflict") {
+  return result === "idempotency-conflict"
+    ? Response.json({ error: "Idempotency-Key was already used for a different request" }, { status: 409 })
+    : new Response(result.body, result);
+}
+
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   private readonly renderInterval = statusRenderInterval(this.env.STATUS_RENDER_INTERVAL_SECONDS);
   private publishedStatus?: PublishedStatus;
   private publicationRetryAt = 0;
   private subscriptionAlarmCheck?: Promise<void>;
+  private readonly confirmationHandoffs = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, createdAt INTEGER NOT NULL,
+      expiresAt INTEGER, digest BLOB NOT NULL UNIQUE
+    )`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS create_results (
+      endpoint TEXT NOT NULL, key TEXT NOT NULL, digest BLOB NOT NULL, expiresAt INTEGER NOT NULL,
+      result TEXT NOT NULL, PRIMARY KEY (endpoint, key)
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS create_results_expiry ON create_results (expiresAt)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_completions (
       deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
     )`);
@@ -177,6 +226,44 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
+
+  listApiKeys() {
+    return this.ctx.storage.sql.exec<ApiKey>(
+      "SELECT id, name, role, createdAt, expiresAt FROM api_keys ORDER BY createdAt DESC, id",
+    ).toArray();
+  }
+
+  async issueApiKey(value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const input = value as Record<string, unknown>;
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    const { role, expiresAt } = input;
+    if (!name || name.length > 120 || (role !== "read" && role !== "write")) return null;
+    const secret = apiKeyPrefix + Array.from(crypto.getRandomValues(new Uint8Array(32)), byte =>
+      byte.toString(16).padStart(2, "0")).join("");
+    const digest = await credentialDigest(`Bearer ${secret}`);
+    const createdAt = Date.now();
+    if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= createdAt))
+      return null;
+    const key: ApiKey = { id: crypto.randomUUID(), name, role, createdAt, expiresAt: expiresAt ?? null };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO api_keys (id, name, role, createdAt, expiresAt, digest) VALUES (?, ?, ?, ?, ?, ?)",
+      key.id, key.name, key.role, key.createdAt, key.expiresAt, digest,
+    );
+    return { key, secret };
+  }
+
+  revokeApiKey(id: string) {
+    return this.ctx.storage.sql.exec("DELETE FROM api_keys WHERE id = ?", id).rowsWritten > 0;
+  }
+
+  apiKeyRole(digest: ArrayBuffer) {
+    const [key] = this.ctx.storage.sql.exec<{ role: ApiKeyRole }>(
+      "SELECT role FROM api_keys WHERE digest = ? AND (expiresAt IS NULL OR expiresAt > ?)", digest, Date.now(),
+    ).toArray();
+    return key?.role;
+  }
+
   issueSubscriptionTicket(contextId: string, origin: string, permission: "reader" | "editor") {
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM subscription_tickets WHERE expiresAt <= ?", now);
@@ -452,7 +539,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private capturePublicationInput(state: StoredContext, revision: number, at: number): PublicationInput {
-    const data = this.project(state, false, false, at);
+    const data = this.project(state, "public", false, at);
     const history = new Map(state.monitors.filter(monitor => monitor.published).map(monitor => [monitor.id, this.historyFence(monitor)]));
     return { revision, at, loggedBefore: Math.floor(at / 1000), data, history };
   }
@@ -803,21 +890,75 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private monitorConfigurations = new MonitorConfigurations({
     minimumCheckIntervalSeconds: () => minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS),
     read: () => this.read(),
-    commit: (state: StoredContext, previousName: string, previous?: Monitor, current?: Monitor) => {
-      return this.commitViewChanges(() => {
-        if (current && previous && current.scheduleRevision !== previous.scheduleRevision) this.resetCalendarEvidence(current);
-        this.ctx.storage.kv.put("context", state);
-        return configurationScopes(previous, current, state.pageName !== previousName);
-      });
-    },
+    commit: (state: StoredContext, previousName: string, previous?: Monitor, current?: Monitor) =>
+      this.commitMonitorConfiguration(state, previousName, previous, current),
   });
+
+  private commitMonitorConfiguration(state: StoredContext, previousName: string, previous?: Monitor, current?: Monitor, record?: () => void) {
+    return this.commitViewChanges(() => {
+      if (current && previous && current.scheduleRevision !== previous.scheduleRevision) this.resetCalendarEvidence(current);
+      this.ctx.storage.kv.put("context", state);
+      record?.();
+      return configurationScopes(previous, current, state.pageName !== previousName);
+    });
+  }
 
   async configure(value: unknown, expectedMonitorId: string | null = null) {
     return this.monitorConfigurations.configure(value, expectedMonitorId);
   }
 
   async create(value: unknown, limit?: number) {
-    return this.monitorConfigurations.create(value, limit);
+    if (value && typeof value === "object" && "destinationIds" in value &&
+        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
+    const result = await this.monitorConfigurations.create(value, limit);
+    if (result === destinationPendingConfirmation) return undefined;
+    return result ? result.ack : result;
+  }
+
+  readMonitorResource(id: string) {
+    const monitor = this.read().monitors.find(monitor => monitor.id === id);
+    return monitor ? monitorResource(monitor) : null;
+  }
+
+  private lookupCreateResult(endpoint: CreateEndpoint, request?: IdempotencyRequest) {
+    if (!request) return;
+    const [saved] = this.ctx.storage.sql.exec<{ result: string | null }>(
+      "SELECT CASE WHEN digest = ? THEN result END AS result FROM create_results WHERE endpoint = ? AND key = ? AND expiresAt > ?",
+      request.digest, endpoint, request.key, Date.now(),
+    ).toArray();
+    if (saved) return saved.result === null ? "idempotency-conflict" as const : JSON.parse(saved.result) as SavedCreateResult;
+  }
+
+  replayCreateResult(endpoint: CreateEndpoint, request: IdempotencyRequest) {
+    const saved = this.lookupCreateResult(endpoint, request);
+    return saved && saved !== "idempotency-conflict" && saved.confirmation
+      ? this.handoffCreateConfirmation(request.key, saved.confirmation).then(() => saved)
+      : saved;
+  }
+
+  private recordCreateResult(endpoint: CreateEndpoint, request: IdempotencyRequest, result: SavedCreateResult) {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO create_results (endpoint, key, digest, expiresAt, result) VALUES (?, ?, ?, ?, ?)",
+      endpoint, request.key, request.digest, now + DAY, JSON.stringify(result),
+    );
+  }
+
+  async createMonitorResource(value: unknown, request?: IdempotencyRequest) {
+    const prepared = await this.monitorConfigurations.prepareCreate(value);
+    // Check again after Calendar validation, which can yield.
+    const concurrent = this.lookupCreateResult(monitorCollection, request);
+    if (concurrent) return concurrent;
+    if (!prepared) return;
+    let response: CreateResult | undefined;
+    const result = this.monitorConfigurations.createPrepared(prepared, undefined, (state, current) => {
+      const created = createdResource(monitorResource(current), monitorCollection);
+      response = created;
+      return this.commitMonitorConfiguration(state, state.pageName, undefined, current, request
+        ? () => this.recordCreateResult(monitorCollection, request, created) : undefined);
+    });
+    if (result === destinationPendingConfirmation) return result;
+    return response;
   }
 
   private migrateDestinations(state: StoredContext) {
@@ -842,6 +983,38 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async configureDestination(id: string | null, update: DestinationUpdate | null, legacy = false, origin?: string) {
+    const result = await this.changeDestination(id, update, legacy, origin);
+    return result && typeof result === "object" ? result.ack : result;
+  }
+
+  async saveVersionedDestination(id: string | null, update: DestinationUpdate, origin?: string) {
+    const result = await this.changeDestination(id, update, false, origin);
+    return result && typeof result === "object" ? result.destination : result;
+  }
+
+  async createDestinationResource(update: DestinationUpdate, origin?: string, request?: IdempotencyRequest) {
+    const saved = request && this.replayCreateResult(versionedDestinationsPath, request);
+    if (saved) return saved;
+    let committed: SavedCreateResult | undefined;
+    const result = await this.changeDestination(null, update, false, origin, request ? (destination, confirmation) => {
+      committed = { ...createdResource(destination), confirmation };
+      this.recordCreateResult(versionedDestinationsPath, request, committed);
+    } : undefined);
+    if (committed?.confirmation && request) {
+      await this.handoffCreateConfirmation(request.key, committed.confirmation);
+    }
+    return committed ?? (result && typeof result === "object"
+      ? result.destination && createdResource(result.destination) : result);
+  }
+
+  versionedDestination(id: string) {
+    const destination = this.read().destinations?.find(candidate => candidate.id === id);
+    return destination ? destinationResource(destination) : null;
+  }
+
+  private async changeDestination(id: string | null, update: DestinationUpdate | null, legacy: boolean, origin?: string,
+    recordCreate?: (destination: NotificationDestination, confirmation?: ConfirmationJob) => void,
+  ) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
     const destinations = state.destinations ?? [];
@@ -855,12 +1028,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const sameAddress = address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
       address?.channel === "email" && existing?.channel === "email" && existing.address === address.address;
     if (existing && (sameAddress || (update && !address))) {
-      if (!name || name === existing.name) return this.unchangedView("destinations");
-      return this.commitViewChanges(() => {
+      const ack = !name || name === existing.name ? this.unchangedView("destinations") : this.commitViewChanges(() => {
         existing.name = name;
         this.ctx.storage.kv.put("context", state);
         return { editor: ["destinations"] };
       });
+      return { ack, destination: destinationResource(existing) };
     }
     const replacement = address && {
       id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
@@ -893,12 +1066,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         }
       }
     }
+    const destination = replacement ? destinationResource(replacement) : null;
     const ack = this.commitViewChanges(() => {
       this.ctx.storage.kv.put("context", state);
+      if (destination) recordCreate?.(destination, job);
       return replacement || existing ? { editor: editorScopes } : {};
     });
-    if (job) await this.enqueueConfirmation(job);
-    return ack;
+    if (job && !recordCreate) await this.enqueueConfirmation(job);
+    return { ack, destination };
   }
 
   async resendConfirmation(id: string, origin: string) {
@@ -933,8 +1108,26 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     try {
       if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
       await this.env.NOTIFICATION_QUEUE.sendBatch([{ body: job }]);
+      return true;
     } catch {
       console.error(JSON.stringify({ event: "notification_enqueue_failed", kind: job.kind }));
+      return false;
+    }
+  }
+
+  private async handoffCreateConfirmation(key: string, job: ConfirmationJob) {
+    if (this.confirmationHandoffs.has(job.deliveryId)) return;
+    this.confirmationHandoffs.add(job.deliveryId);
+    try {
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      if (state && this.currentConfirmation(state, job) && !await this.enqueueConfirmation(job)) return;
+      this.ctx.storage.sql.exec(
+        `UPDATE create_results SET result = json_remove(result, '$.confirmation')
+         WHERE endpoint = ? AND key = ? AND json_extract(result, '$.confirmation.deliveryId') = ?`,
+        versionedDestinationsPath, key, job.deliveryId,
+      );
+    } finally {
+      this.confirmationHandoffs.delete(job.deliveryId);
     }
   }
 
@@ -996,7 +1189,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async edit(id: string, value: unknown) {
-    return this.monitorConfigurations.edit(id, value);
+    const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return undefined;
+    return result ? result.ack : result;
+  }
+
+  async editMonitorResource(id: string, value: unknown) {
+    const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return result;
+    return result ? monitorResource(result.monitor) : result;
   }
 
   private endMaintenance(monitor: Monitor) {
@@ -1105,6 +1306,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async check(at: number, writeLimit = availabilityWriteLimit) {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM create_results WHERE rowid IN (
+        SELECT rowid FROM create_results WHERE expiresAt <= ? ORDER BY expiresAt LIMIT ?
+      )`,
+      Date.now(), createResultCleanupLimit,
+    );
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
     const calendarPolicy = this.prepareOutboundCalendars();
@@ -1494,10 +1701,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return state.monitors.filter(monitor => selected.has(monitor.id));
   }
 
-  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, includePrivate: boolean) {
     return this.availability.read(this.projectedMonitors(state, projection), at, () => {
       const state = this.ctx.storage.kv.get<StoredContext>("context");
-      return new Map(state?.monitors.filter(monitor => operator || monitor.published)
+      return new Map(state?.monitors.filter(monitor => includePrivate || monitor.published)
         .map(monitor => [monitor.id, monitor.historyRevision]));
     });
   }
@@ -1519,15 +1726,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   snapshot(operator = false, secrets = operator) {
     const at = Date.now();
     const state = this.read(at);
-    const data = this.project(state, operator, secrets, at);
+    const data = this.project(state, operator ? "operator" : "public", secrets, at);
     return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
   }
 
   async status(operator = false, secrets = operator): Promise<StatusProjection> {
     const at = Date.now();
     const state = this.read(at);
-    const data = this.project(state, operator, secrets, at);
+    const data = this.project(state, operator ? "operator" : "public", secrets, at);
     return attachAvailability(data, await this.readAvailability(state, data, at, operator));
+  }
+
+  async versionedStatus() {
+    const at = Date.now();
+    const state = this.read(at);
+    const data = this.project(state, "versioned", false, at);
+    return statusJson(attachAvailability(data, await this.readAvailability(state, data, at, true)));
   }
 
   async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
@@ -1539,7 +1753,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const state = this.read(at);
     const revision = this.viewClock()[audience];
     const operator = audience !== "public";
-    const data = this.project(state, operator, audience === "editor", at, scopes);
+    const data = this.project(state, operator ? "operator" : "public", audience === "editor", at, scopes);
     if (revision < minimum || !scopes.some(includesLedger)) return { revision, data };
     const monitors = scopes.includes("monitors") ? data.monitors
       : data.monitors.filter(monitor => scopes.includes(`monitor/${monitor.id}`));
@@ -1548,13 +1762,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return { revision, data: attachAvailability(data, history) };
   }
 
-  private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scopes?: ViewScope[]) {
+  private project(state: StoredContext, audience: "public" | "operator" | "versioned", secrets: boolean, at: number, scopes?: ViewScope[]) {
+    const operator = audience === "operator";
     const start = historyStart(at);
     const publicBanner = !operator && scopes?.includes("banner") && !scopes.includes("incidents");
     const withIncidents = !scopes || scopes.includes("incidents") || publicBanner;
     const withAllMonitors = withIncidents || scopes?.includes("monitors") || scopes?.includes("destinations");
     const visible = withAllMonitors || scopes?.some(includesLedger)
-      ? state.monitors.filter(monitor => (operator || monitor.published) &&
+      ? state.monitors.filter(monitor => (audience !== "public" || monitor.published) &&
         (withAllMonitors || scopes?.includes(`monitor/${monitor.id}`))) : [];
     const monitors = visible.map(monitor => ({
       ...publicMonitor(monitor, !!state.paused),
@@ -1611,15 +1826,11 @@ function attachAvailability(status: StatusProjection, history: Map<string, Avail
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
-async function authorized(request: Request, secret: string | undefined) {
+async function authorized(authorization: string | undefined, secret: string | undefined) {
   if (!secret) return false;
-  const encoder = new TextEncoder();
   const [actual, expected] = await Promise.all([
-    crypto.subtle.digest(
-      "SHA-256",
-      encoder.encode(request.headers.get("Authorization") ?? ""),
-    ),
-    crypto.subtle.digest("SHA-256", encoder.encode(`Bearer ${secret}`)),
+    credentialDigest(authorization ?? ""),
+    credentialDigest(`Bearer ${secret}`),
   ]);
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
@@ -1709,6 +1920,7 @@ type HttpEnv<E extends EngineEnv> = {
     context: DurableObjectStub<MonitoringContext>;
     permission: "editor" | "reader";
     value: unknown;
+    idempotency?: IdempotencyRequest;
     selectedMonitorId: string | null;
     emailOrigin: Promise<string | undefined>;
   };
@@ -1782,20 +1994,19 @@ function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, a
 async function readBoundedBody(request: Request, maxBytes = 4096) {
   if (Number(request.headers.get("Content-Length")) > maxBytes) return null;
   const reader = request.body?.getReader();
-  if (!reader) return "";
-  const decoder = new TextDecoder();
-  let body = "";
+  if (!reader) return new Uint8Array(0);
+  const body = new Uint8Array(maxBytes);
   let bytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) return body + decoder.decode();
-      bytes += value.length;
-      if (bytes > maxBytes) {
+      if (done) return body.subarray(0, bytes);
+      if (bytes + value.length > maxBytes) {
         await reader.cancel();
         return null;
       }
-      body += decoder.decode(value, { stream: true });
+      body.set(value, bytes);
+      bytes += value.length;
     }
   } finally {
     reader.releaseLock();
@@ -1839,7 +2050,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
     if (c.get("resolved")) return new Response(null, { status: 404 });
-    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET)))
+    if (!(await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (c.req.method !== "POST") return methodNotAllowed("POST");
     const accepted = await c.get("context").heartbeat(c.req.path.slice("/heartbeat/".length), Date.now());
@@ -1879,6 +2090,21 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
   app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) =>
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
+  const versionedAuthorization = (required: ApiKeyRole): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
+    if (c.get("resolved")) return c.notFound();
+    const authorization = canonicalBearer(c.req.header("Authorization"));
+    if (!(await authorized(authorization, c.env.INSTALLATION_SECRET))) {
+      const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
+        ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
+      if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+      if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    await next();
+  };
+  const versionedStatusPath = "/api/v1/status";
+  app.use(versionedStatusPath, versionedAuthorization("read"));
+  app.all(versionedStatusPath, async c => c.req.method === "GET"
+    ? c.json(await c.get("context").versionedStatus()) : methodNotAllowed("GET"));
   const asset = (render: StatusRender): MiddlewareHandler<HttpEnv<E>> => async c => {
     const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(render.body));
     const version = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
@@ -1913,7 +2139,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
       const body = await readBoundedBody(c.req.raw);
       if (body === null) return new Response(null, { status: 413 });
-      const tokens = new URLSearchParams(body).getAll("token");
+      const tokens = new URLSearchParams(new TextDecoder().decode(body)).getAll("token");
       const [token] = tokens;
       const context = c.get("context");
       const origin = new URL(c.req.url).origin;
@@ -1930,17 +2156,27 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const previewPath = "/api/operator/schedule-preview";
   const ticketPath = "/api/operator/events/ticket";
   const destinationsPath = "/api/operator/destinations";
+  const versionedDestinationPath = versionedDestinationsPath + "/:id";
+  for (const path of [versionedDestinationsPath, versionedDestinationPath]) app.use(path, versionedAuthorization("write"));
+  const apiKeysPath = "/api/operator/api-keys";
+  const apiKeyPath = apiKeysPath + "/:id";
   const destinationPath = destinationsPath + "/:id";
   const resendPath = destinationPath + "/confirmation";
   const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
+  for (const path of [apiKeysPath, apiKeyPath]) app.use(path, async (c, next) => {
+    if (c.get("resolved")) return c.notFound();
+    if (!(await authorized(canonicalBearer(c.req.header("Authorization")), c.env.INSTALLATION_SECRET)))
+      return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+    await next();
+  });
   const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
-    const permission = resolved ? resolved.permission : await authorized(c.req.raw, c.env.INSTALLATION_SECRET) ? "editor" : null;
+    const permission = resolved ? resolved.permission : await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET) ? "editor" : null;
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
@@ -1991,29 +2227,92 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   const readBody: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
     const request = c.req.raw;
-    if (!request.headers.get("Content-Type")?.startsWith("application/json"))
+    const contentType = request.headers.get("Content-Type");
+    const json = c.req.path.startsWith("/api/v1/")
+      ? contentType?.split(";", 1)[0].trim().toLowerCase() === "application/json"
+      : contentType?.startsWith("application/json");
+    if (!json)
       return Response.json(
         { error: "Use application/json" },
         { status: 415 },
       );
-    const maxBytes = c.req.path === destinationsPath || c.req.path.startsWith(destinationsPath + "/") ? 16_384 : 4096;
+    const maxBytes = [destinationsPath, versionedDestinationsPath].some(path =>
+      c.req.path === path || c.req.path.startsWith(path + "/")) ? 16_384 : 4096;
     if (Number(request.headers.get("Content-Length")) > maxBytes)
       return new Response(null, { status: 413 });
     const selectedMonitorId = c.req.path === "/api/operator" ? await c.get("context").firstMonitorId() : null;
     c.set("selectedMonitorId", selectedMonitorId);
     const body = await readBoundedBody(request, maxBytes);
     if (body === null) return new Response(null, { status: 413 });
+    const endpoint = c.req.path;
+    if (request.method === "POST" && (endpoint === monitorCollection || endpoint === versionedDestinationsPath)) {
+      const key = c.req.header("Idempotency-Key");
+      if (key !== undefined) {
+        if (key.includes(",") || !/^[!-~]{1,128}$/.test(key))
+          return Response.json({ error: "Invalid Idempotency-Key" }, { status: 400 });
+        const digest = await crypto.subtle.digest("SHA-256", body);
+        const idempotency = { key, digest };
+        const saved = await c.get("context").replayCreateResult(endpoint, idempotency);
+        if (saved) return createResponse(saved);
+        c.set("idempotency", idempotency);
+      }
+    }
     let value: unknown;
     try {
-      value = JSON.parse(body);
+      value = JSON.parse(new TextDecoder().decode(body));
     } catch {
       return Response.json({ error: "Invalid JSON" }, { status: 400 });
     }
     c.set("value", value);
     await next();
   };
+  app.get(apiKeysPath, async c => c.req.method === "GET"
+    ? c.json({ keys: await c.get("context").listApiKeys() }) : methodNotAllowed("GET, POST"));
+  app.post(apiKeysPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const issued = await c.get("context").issueApiKey(c.get("value"));
+    return issued ? c.json(issued, 201) : c.json({ error: "Invalid API key name, role or expiry" }, 400);
+  });
+  app.delete(apiKeyPath, async c => {
+    const revoked = await c.get("context").revokeApiKey(c.req.path.slice(apiKeysPath.length + 1));
+    return revoked ? new Response(null, { status: 204 }) : c.json({ error: "API key not found" }, 404);
+  });
+  app.all(apiKeysPath, () => methodNotAllowed("GET, POST"));
+  app.all(apiKeyPath, () => methodNotAllowed("DELETE"));
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
+  const monitorResourcePath = monitorCollection + "/:id";
+  for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write"));
+  const invalidMonitor = () => Response.json({ error: "Invalid Monitor configuration" }, { status: 400 });
+  const pendingAssignment = () => Response.json({
+    error: "An email destination is awaiting confirmation",
+    code: destinationPendingConfirmation,
+  }, { status: 400 });
+  const missingMonitor = () => Response.json({ error: "Monitor not found" }, { status: 404 });
+  app.get(monitorResourcePath, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
+    const monitor = await c.get("context").readMonitorResource(monitorId(c));
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.post(monitorCollection, readBody, async (c: Context<HttpEnv<E>>) => {
+    const monitor = await c.get("context").createMonitorResource(c.get("value"), c.get("idempotency"));
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
+    return monitor ? createResponse(monitor) : invalidMonitor();
+  });
+  app.patch(monitorResourcePath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    if (value && typeof value === "object" && "destinationChanges" in value) return invalidMonitor();
+    const monitor = await c.get("context").editMonitorResource(monitorId(c), value);
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
+    if (monitor === undefined) return invalidMonitor();
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.delete(monitorResourcePath, async c => {
+    const removed = await c.get("context").remove(monitorId(c));
+    return removed ? new Response(null, { status: 204 }) : missingMonitor();
+  });
+  app.all(monitorCollection, () => methodNotAllowed("POST"));
+  app.all(monitorResourcePath, () => methodNotAllowed("GET, PATCH, DELETE"));
+
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
     app.get(path, async (c: Context<HttpEnv<E>>) => {
       if (c.req.method !== "GET")
@@ -2040,39 +2339,78 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
     return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
   });
-  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | null | "duplicate" | "duplicate-name" | "unconfigured" | "cooldown" | "paused", status = 200) {
+  function destinationError(result: DestinationError | null) {
     if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
     if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
     if (result === "duplicate-name") return Response.json({ error: "A destination with this name already exists" }, { status: 409 });
     if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
     if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
-    return result ? operatorMutationResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
+    return Response.json({ error: "Destination not found" }, { status: 404 });
   }
-  const saveDestination = async (c: Context<HttpEnv<E>>) => {
-    const value = c.get("value");
+  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | DestinationError | null, status = 200) {
+    return result && typeof result === "object" ? operatorMutationResponse(c, result, status) : destinationError(result);
+  }
+  async function parseDestinationUpdate(value: unknown, creating: boolean, readSaved?: () => Promise<NotificationDestination | null>): Promise<DestinationUpdate | Response> {
     const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const name = typeof fields.name === "string" ? fields.name.trim() : undefined;
     if (fields.name !== undefined && (!name || name.length > 120 || /[\r\n]/.test(name)))
       return Response.json({ error: "Enter a destination name of up to 120 characters on one line" }, { status: 400 });
-    const creating = c.req.method === "POST";
     if (!creating && name && fields.channel === undefined && fields.url === undefined && fields.address === undefined)
-      return destinationResponse(c, await c.get("context").configureDestination(monitorId(c), { name }));
-    let destination: NewNotificationDestination & { name?: string };
-    let origin: string | undefined;
+      return { name };
     if (fields.channel === "email") {
       const address = parseEmailAddress(fields.address);
       if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
-      origin = await confirmationOrigin(c);
-      destination = { channel: "email", address, name };
-    } else {
-      const url = parseWebhook(fields.url);
-      if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
-        return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-      destination = { channel: "webhook", url, name };
+      return { channel: "email", address, name };
     }
+    const invalidWebhook = () => Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+    if (fields.channel !== undefined && fields.channel !== "webhook") return invalidWebhook();
+    const normalized = parseWebhook(fields.url);
+    // A saved webhook can exceed the input limit after Discord normalization.
+    const saved = readSaved && typeof fields.url === "string" && normalized !== fields.url ? await readSaved() : null;
+    const url = saved?.channel === "webhook" && saved.url === fields.url ? saved.url : normalized;
+    return url ? { channel: "webhook", url, name } : invalidWebhook();
+  }
+  const prepareDestination = async (c: Context<HttpEnv<E>>, creating: boolean, versionedId?: string) => {
+    const destination = await parseDestinationUpdate(c.get("value"), creating,
+      versionedId === undefined ? undefined : () => c.get("context").versionedDestination(versionedId));
+    if (destination instanceof Response) return destination;
+    const origin = "channel" in destination && destination.channel === "email" ? await confirmationOrigin(c) : undefined;
+    return { destination, origin };
+  };
+  const saveDestination = async (c: Context<HttpEnv<E>>) => {
+    const creating = c.req.method === "POST";
+    const prepared = await prepareDestination(c, creating);
+    if (prepared instanceof Response) return prepared;
+    const { destination, origin } = prepared;
     const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
     return destinationResponse(c, result, creating ? 201 : 200);
   };
+  const versionedDestinationId = (c: Context<HttpEnv<E>>) => c.req.path.slice(versionedDestinationsPath.length + 1);
+  app.post(versionedDestinationsPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const prepared = await prepareDestination(c, true);
+    if (prepared instanceof Response) return prepared;
+    const result = await c.get("context").createDestinationResource(prepared.destination, prepared.origin, c.get("idempotency"));
+    return result === "idempotency-conflict" || (result && typeof result === "object")
+      ? createResponse(result) : destinationError(result);
+  });
+  app.all(versionedDestinationsPath, () => methodNotAllowed("POST"));
+  app.get(versionedDestinationPath, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
+    const destination = await c.get("context").versionedDestination(versionedDestinationId(c));
+    return destination ? c.json(destination) : destinationError(null);
+  });
+  app.patch(versionedDestinationPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const id = versionedDestinationId(c);
+    const prepared = await prepareDestination(c, false, id);
+    if (prepared instanceof Response) return prepared;
+    const result = await c.get("context").saveVersionedDestination(id, prepared.destination, prepared.origin);
+    return result && typeof result === "object" ? c.json(result) : destinationError(result);
+  });
+  app.delete(versionedDestinationPath, async c => {
+    const result = await c.get("context").configureDestination(versionedDestinationId(c), null);
+    return result && typeof result === "object" ? new Response(null, { status: 204 }) : destinationError(result);
+  });
+  app.all(versionedDestinationPath, () => methodNotAllowed("GET, PATCH, DELETE"));
   app.post(destinationsPath, readBody, saveDestination);
   app.put(destinationPath, readBody, saveDestination);
   app.post(resendPath, async c => {
